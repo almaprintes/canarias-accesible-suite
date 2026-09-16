@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Postventa Canarias</title>
+<link rel="apple-touch-icon" href="./public/assets/icons/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <meta name="theme-color" content="#0b5cff">
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="lp">
+    <div class="lp-card">
+<img class="lp-logo" src="public/assets/img/logo-canarias-accesible-2.png" alt="Canarias accesible" />
+
+      <div style="display:flex;justify-content:flex-start;margin-bottom:12px"><a href="../index.html" style="text-decoration:none;font-weight:800;color:#0b5cff">← VOLVER A SUITE</a></div>
+      <div class="lp-actions">
+        <a class="lp-btn primary" href="./nuevo-parte.html">NUEVO PARTE</a>
+        <a class="lp-btn" href="./historial.html">HISTORIAL</a>
+        <button class="lp-btn danger" id="btn-clear-sent" type="button">BORRAR ENVIADOS</button>
+      </div>
+
+      <p class="lp-foot">Postventa · Partes en el móvil</p>
+    </div>
+  </main>
+
+  <script>
+    // Service Worker (mejor aquí: la landing siempre se visita)
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("./service-worker.js").catch(() => {});
+
+        // Badge versión (iOS-safe): pedir al SW activo del registro
+        const elVer = document.getElementById("sw-version");
+        if (!elVer) return;
+
+        const setVer = (vNum, cacheName) => {
+          const shown = (Number(vNum || 0) / 100).toFixed(2);
+          elVer.textContent = `Versión ${shown}`;
+          elVer.title = cacheName ? `Cache: ${cacheName}` : "";
+        };
+
+        // Recibir respuesta del SW (viene por postMessage)
+        navigator.serviceWorker.addEventListener("message", (event) => {
+          const d = event.data || {};
+          if (d.type === "SW_VERSION") {
+            setVer(d.version, d.cache);
+          }
+        });
+
+        // Pedir versión al SW activo (NO al controller, que en iOS suele ser null)
+        navigator.serviceWorker.ready.then((reg) => {
+          const sw = reg.active || reg.waiting || reg.installing;
+          if (sw) sw.postMessage({ type: "GET_VERSION" });
+        }).catch(() => {});
+      });
+    }
+
+    // Badge versión: robusto en iOS -> lee caches directamente + (si puede) pregunta al SW
+    (function () {
+      const el = document.getElementById("sw-version");
+      if (!el) return;
+
+      const show = (vNum, cacheName) => {
+        const shown = (Number(vNum || 0) / 100).toFixed(2);
+        el.textContent = `Versión ${shown}`;
+        el.title = cacheName ? `Cache: ${cacheName}` : "";
+      };
+
+      const showUnknown = () => {
+        el.textContent = "Versión —";
+        el.title = "No se detectó cache";
+      };
+
+      async function readFromCaches() {
+        if (!("caches" in window)) return false;
+        try {
+          const keys = await caches.keys();
+          let bestV = -1;
+          let bestName = null;
+
+          for (const k of keys) {
+            const m = String(k).match(/postventa-canarias-v(\d+)\b/i);
+            if (!m) continue;
+            const v = parseInt(m[1], 10);
+            if (Number.isFinite(v) && v > bestV) {
+              bestV = v;
+              bestName = k;
+            }
+          }
+
+          if (bestV >= 0) {
+            show(bestV, bestName);
+            return true;
+          }
+        } catch (_) {}
+        return false;
+      }
+
+      function requestFromSW() {
+        if (!("serviceWorker" in navigator)) return;
+
+        // En iOS muchas veces navigator.serviceWorker.controller es null aunque el SW esté activo.
+        // En ese caso, enviamos el mensaje al worker activo del registro (esto sí funciona).
+        navigator.serviceWorker.ready.then((reg) => {
+          try {
+            const sw = reg.active || reg.waiting || reg.installing;
+            if (sw) sw.postMessage({ type: "GET_VERSION" });
+          } catch (_) {}
+        }).catch(() => {});
+      }
+
+      if ("serviceWorker" in navigator) {
+        navigator.serviceWorker.addEventListener("message", (event) => {
+          const d = event.data || {};
+          if (d.type === "SW_VERSION") {
+            show(d.version, d.cache);
+          }
+        });
+
+        navigator.serviceWorker.addEventListener("controllerchange", () => {
+          setTimeout(() => { readFromCaches(); requestFromSW(); }, 150);
+        });
+
+        navigator.serviceWorker.ready.then(() => {
+          setTimeout(() => { readFromCaches(); requestFromSW(); }, 150);
+        });
+      }
+
+      // Pintado inicial
+      readFromCaches().then((ok) => {
+        if (!ok) showUnknown();
+        requestFromSW();
+      });
+
+      // Reintentos por si el SW se instala/activa después en iOS
+      setTimeout(() => { readFromCaches(); requestFromSW(); }, 400);
+      setTimeout(() => { readFromCaches(); requestFromSW(); }, 1200);
+    })();
+
+    // Borrar enviados (sin tocar pendientes)
+    (function () {
+      const btn = document.getElementById("btn-clear-sent");
+      if (!btn) return;
+
+      const KEY = "pv_partes";
+
+      function safeParseArray(json) {
+        try {
+          const v = JSON.parse(json || "[]");
+          return Array.isArray(v) ? v : [];
+        } catch {
+          return [];
+        }
+      }
+
+      // “Enviado” si:
+      // - tiene sent_by con alguna clave (marcado por Historial al exportar)
+      // - o tiene sent_at (legacy)
+      function isSent(p) {
+        const sb = p && p.sent_by;
+        const hasSentBy = sb && typeof sb === "object" && Object.keys(sb).length > 0;
+        const hasLegacy = Boolean(p && p.sent_at);
+        return hasSentBy || hasLegacy;
+      }
+
+      btn.addEventListener("click", () => {
+        const all = safeParseArray(localStorage.getItem(KEY));
+        if (!all.length) {
+          alert("No hay partes guardados.");
+          return;
+        }
+
+        const sentCount = all.reduce((n, p) => n + (isSent(p) ? 1 : 0), 0);
+        if (!sentCount) {
+          alert("No hay partes ENVIADOS para borrar.");
+          return;
+        }
+
+        const msg =
+          `Vas a borrar ${sentCount} parte(s) ENVIADO(s).\n` +
+          `Los PENDIENTES NO se borran.\n\n` +
+          `¿Continuar?`;
+
+        if (!confirm(msg)) return;
+
+        const kept = all.filter(p => !isSent(p));
+        localStorage.setItem(KEY, JSON.stringify(kept));
+
+        alert(`Listo ✅ Borrados: ${sentCount}. Pendientes conservados: ${kept.length}.`);
+      });
+    })();
+  </script>
+
+  <style>
+    /* No redefinas variables globales aquí: usa las de styles.css y fallback si faltan */
+    :root{
+      --lp-bg: #ffffff;
+      --lp-shadow: 0 18px 55px rgba(2,8,23,.08);
+      --lp-border: rgba(148,163,184,.35);
+    }
+
+    body{
+      margin:0;
+      font-family: var(--font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial);
+      color: var(--text, #0f172a);
+      background: var(--lp-bg);
+      -webkit-text-size-adjust: 100%;
+    }
+
+    .lp{
+      min-height:100vh;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:18px;
+    }
+
+    .lp-card{
+      width:min(520px, 100%);
+      border:1px solid var(--line, var(--lp-border));
+      border-radius:22px;
+      padding:22px;
+      box-shadow: var(--shadow, var(--lp-shadow));
+      background:#fff;
+      text-align:center;
+    }
+
+    .lp-logo{
+      width:min(360px, 100%);
+      height:auto;
+      display:block;
+      margin:6px auto 18px;
+      user-select:none;
+      -webkit-user-drag:none;
+    }
+
+    .lp-actions{
+      display:grid;
+      gap:12px;
+      margin-top:10px;
+    }
+
+    .lp-btn{
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      height:72px;
+      border-radius:20px;
+      text-decoration:none;
+      font-weight:900;
+      font-size:22px;
+      letter-spacing:.4px;
+      border:1px solid rgba(11,92,255,.35);
+      color: var(--primary, #0b5cff);
+      background:#fff;
+
+      -webkit-tap-highlight-color: transparent;
+      user-select:none;
+      transition: transform .04s ease;
+    }
+
+    .lp-btn:active{ transform: translateY(1px); }
+
+    .lp-btn.primary{
+      background: var(--primary, #0b5cff);
+      color:#fff;
+      border-color: transparent;
+    }
+
+    .lp-btn.danger{
+      background:#fff;
+      color:#b91c1c;
+      border:1px solid rgba(185,28,28,.35);
+    }
+
+    .lp-foot{
+      margin:14px 0 0;
+      color: var(--muted, #64748b);
+      font-weight:800;
+      font-size:14px;
+    }
+  </style>
+  <div id="sw-version" style="
+  position: fixed;
+  right: 10px;
+  bottom: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  opacity: 0.70;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(0,0,0,0.35);
+  color: #fff;
+  z-index: 9999;
+">
+  Versión --
+</div>
+</body>
+</html>

@@ -1,0 +1,773 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Historial · Postventa Canarias</title>
+
+  <link rel="manifest" href="./manifest.webmanifest">
+  <meta name="theme-color" content="#0b5cff">
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+<script src="./techs-config.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="back" href="./index.html" aria-label="Volver">←</a>
+    <h1>Historial</h1>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2>Filtro</h2>
+
+      <div class="field onecol">
+        <span>Fecha</span>
+        <input id="fFecha" type="date" />
+      </div>
+
+      <div class="field onecol">
+        <span>Técnico</span>
+        <select id="fTec" style="width:100%; height:56px; border-radius:14px; border:1px solid var(--line); font-size:18px; padding:0 12px;">
+          <option value="">Todos</option>
+          <option value="JUAN PABLO CABRERA PEREZ">JUAN PABLO CABRERA PEREZ</option>
+          <option value="DAMASO ROLDAN PEREZ">DAMASO ROLDAN PEREZ</option>
+          <option value="PABLO ECHEDEY ESPINO ORTEGA">PABLO ECHEDEY ESPINO ORTEGA</option>
+          <option value="YISHAR ROMAN MEDINA">YISHAR ROMAN MEDINA</option>
+        </select>
+      </div>
+
+      <label style="display:flex; align-items:center; gap:10px; margin-top:12px; font-weight:800;">
+        <input id="fTodasFechas" type="checkbox" style="width:20px; height:20px;" />
+        Mostrar partes de cualquier fecha
+      </label>
+
+      <label style="display:flex; align-items:center; gap:10px; margin-top:12px; font-weight:800;">
+        <input id="fPendientes" type="checkbox" style="width:20px; height:20px;" />
+        Mostrar no enviados de cualquier fecha
+      </label>
+
+      <div class="btnRow" style="margin-top:12px;">
+        <button id="btnRefresh" class="btn-secondary" type="button">ACTUALIZAR LISTA</button>
+        <button id="btnCierre" class="btn-primary" type="button">📄 CIERRE DEL DÍA (PDF)</button>
+      </div>
+
+      <p class="msg ok" id="ok" aria-live="polite"></p>
+      <p class="msg" id="err" aria-live="polite"></p>
+    </section>
+
+    <section class="card">
+      <h2>Partes</h2>
+      <div id="list"></div>
+    </section>
+  </main>
+
+<script type="module">
+import { getPartes, saveParte, deleteParte } from "./db.js";
+
+  const EUR = (n) => new Intl.NumberFormat("es-ES", { style:"currency", currency:"EUR" }).format(n);
+
+    const ok = document.getElementById("ok");
+    const err = document.getElementById("err");
+    const list = document.getElementById("list");
+    const fFecha = document.getElementById("fFecha");
+    const fTec = document.getElementById("fTec");
+    const fPendientes = document.getElementById("fPendientes");
+    const fTodasFechas = document.getElementById("fTodasFechas");
+    const btnRefresh = document.getElementById("btnRefresh");
+    const btnCierre = document.getElementById("btnCierre");
+
+    const PARTS_KEY = "pv_partes";
+    const LAST_TEC_KEY = "pv_hist_tec";
+
+    const todayISO = () => new Date().toISOString().slice(0,10);
+
+    // Defaults
+    fFecha.value = todayISO();
+    try {
+      const lastTec = localStorage.getItem(LAST_TEC_KEY) || "";
+      if (lastTec) fTec.value = lastTec;
+    } catch {}
+
+    fTec.addEventListener("change", () => {
+      try { localStorage.setItem(LAST_TEC_KEY, fTec.value || ""); } catch {}
+    });
+
+const loadAll = async () => {
+  try { return await getPartes(); }
+  catch { return []; }
+};
+
+const saveAll = async (arr) => {
+  for (const p of arr) {
+    await saveParte(p);
+  }
+};
+
+    // --- Helpers datos ---
+    const partDate = (p) => (p?.header?.fecha || "");
+    const partId = (p) => (p?.part_id || "");
+
+    // técnicos asociados al parte (1 o 2)
+    const partTechs = (p) => {
+      const h = p?.header || {};
+      const t = [];
+      if (h.tecnico) t.push(h.tecnico);
+      if (h.tecnico1) t.push(h.tecnico1);
+      if (h.tecnico2) t.push(h.tecnico2);
+      return [...new Set(t)].filter(Boolean);
+    };
+
+    // Estado ENVIADO por técnico (nuevo), fallback al viejo sent_at
+    const isSentForTec = (p, tec) => {
+      if (!tec) return Boolean(p?.sent_at);
+      const sb = p?.sent_by || {};
+      if (sb && sb[tec] && sb[tec].sent_at) return true;
+      return Boolean(p?.sent_at);
+    };
+
+    // Garantiza part_id en todos los registros (retrocompatible)
+const ensureIds = async (all) => {
+  let changed = false;
+  const now = Date.now();
+  const out = all.map((p, i) => {
+    if (p && !p.part_id) {
+      changed = true;
+      const f = p?.header?.fecha || "nodate";
+      const idc = p?.header?.idCliente || "noclient";
+      const typ = p?.tipo || "tipo";
+      const ts = p?.saved_at || new Date(now + i).toISOString();
+      return { ...p, part_id: `${f}::${idc}::${typ}::${ts}::${i}` };
+    }
+    return p;
+  });
+  if (changed) await saveAll(out);
+  return out;
+};
+
+    // Total estimado (fallback) si no guardaste totales
+    const computeTotalFallback = (p) => {
+      const d = p?.datos || {};
+      const t = p?.tarifas || {};
+      const tipo = p?.tipo || "";
+
+      const toN = (x) => (Number.isFinite(Number(x)) ? Number(x) : 0);
+      const toI = (x) => {
+        const n = Math.floor(toN(x));
+        return Number.isFinite(n) && n > 0 ? n : 0;
+      };
+
+      const P_PILA = toN(t.P_PILA ?? 1.0);
+
+      if (tipo === "instalacion") {
+        const hi = toN(d.horas_inst);
+        const hd = toN(d.horas_despl);
+        const km = toN(d.kms);
+
+        const al = toN(d.almuerzo);
+        const ce = toN(d.cena);
+        const coLegacy = toN(d.comida);
+        const dietas = (al || ce) ? (al + ce) : coLegacy;
+
+        const ma = toN(d.material);
+        const fu = d.furgon ? toN(t.FURGON ?? 80) : 0;
+
+        const P_INST = toN(t.P_INST ?? 27.95);
+        const P_DESPL = toN(t.P_DESPL ?? 19.28);
+        const P_KM = toN(t.P_KM ?? 0.31);
+        const TEC = 2;
+
+        const a = hi * P_INST * TEC;
+        const b = hd * P_DESPL * TEC;
+        const c = km * P_KM;
+        return a + b + c + dietas + ma + fu;
+      }
+
+      if (tipo === "reparacion") {
+        const hr = toN(d.horas_rep);
+        const hd = toN(d.horas_despl);
+        const km = toN(d.kms);
+        const co = toN(d.comida);
+
+        const maBase = toN(d.material);
+        const bat = toN(d.bateria);
+        const ma = maBase + bat;
+
+        const pil = toI(d.pilas);
+
+        const P_REP = toN(t.P_REP ?? 32.14);
+        const P_DESPL = toN(t.P_DESPL ?? 19.28);
+        const P_KM = toN(t.P_KM ?? 0.31);
+
+        const a = hr * P_REP;
+        const b = hd * P_DESPL;
+        const c = km * P_KM;
+
+        return a + b + c + co + ma + (pil * P_PILA);
+      }
+
+      if (tipo === "mantenimiento") {
+        const fijo = toN(d.fijo ?? (t.FIJO ?? 99));
+        const mat = toN(d.material);
+        const bat = toN(d.bateria);
+        const pil = toI(d.pilas);
+        return fijo + mat + bat + (pil * P_PILA);
+      }
+
+      return toN(p?.totales?.total ?? 0);
+    };
+
+    // XSS escape simple
+    const esc = (s) => String(s || "").replace(/[&<>"']/g, m => ({
+      '&':'&amp;',
+      '<':'&lt;',
+      '>':'&gt;',
+      '"':'&quot;',
+      "'":'&#39;'
+    }[m]));
+
+const render = async () => {
+      ok.textContent = "";
+      err.textContent = "";
+
+let all = await ensureIds(await loadAll());
+
+      const date = (fFecha.value || "").trim();
+      const tec = (fTec.value || "").trim();
+      const soloPendientes = !!fPendientes?.checked;
+      const todasFechas = !!fTodasFechas?.checked;
+
+      const filtered = all
+        .filter(p => {
+          if (todasFechas) return true;      // muestra todo sin importar la fecha
+          if (soloPendientes) return true;   // modo viejo: pendientes globales
+          return !date || partDate(p) === date;
+        })
+        .filter(p => !tec || partTechs(p).includes(tec))
+        .filter(p => !soloPendientes || !isSentForTec(p, tec))
+        .sort((a,b) => (b.saved_at || "").localeCompare(a.saved_at || ""));
+
+      if (!filtered.length) {
+        list.innerHTML = `<p style="color:var(--muted); font-weight:800;">No hay partes para ese filtro.</p>`;
+        return;
+      }
+      list.innerHTML = filtered.map((p) => {
+        const tipo = p.tipo || "—";
+        const id = p.header?.idCliente || "—";
+        const fecha = p.header?.fecha || "—";
+        const techs = partTechs(p).join(" + ") || "—";
+
+        const tot = (typeof p?.totales?.total === "number") ? p.totales.total : computeTotalFallback(p);
+        const sent = isSentForTec(p, tec) ? "ENVIADO" : "PENDIENTE";
+        const sentColor = isSentForTec(p, tec) ? "#15803d" : "#b45309";
+
+        return `
+          <div class="card" style="margin:12px 0; box-shadow:none;">
+            <div style="display:flex; justify-content:space-between; gap:10px; align-items:center;">
+              <div style="font-weight:1000; font-size:18px;">${esc(tipo).toUpperCase()} · ${esc(id)}</div>
+              <div style="font-weight:1000; font-size:14px; color:${sentColor};">${sent}</div>
+            </div>
+
+            <div style="margin-top:8px; color:var(--muted); font-weight:800;">
+              <div>Fecha: <strong style="color:var(--text)">${esc(fecha)}</strong></div>
+              <div>Técnicos: <strong style="color:var(--text)">${esc(techs)}</strong></div>
+              <div>Total: <strong style="color:var(--text)">${esc(EUR(tot))}</strong></div>
+            </div>
+
+            <div class="btnRow" style="margin-top:12px;">
+              <button class="btn-secondary" type="button" data-act="del" data-id="${esc(p.part_id)}">BORRAR</button>
+            </div>
+          </div>
+        `;
+      }).join("");
+
+      list.querySelectorAll("button[data-act='del']").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const id = btn.dataset.id;
+          if (!id) return;
+
+          const okDel = confirm("¿Borrar este parte del teléfono?");
+          if (!okDel) return;
+
+          await deleteParte(id);
+          await render();
+        });
+      });
+    };
+
+    btnRefresh.addEventListener("click", render);
+    fPendientes?.addEventListener("change", render);
+    fTodasFechas?.addEventListener("change", render);
+
+    // ---------- PDF Cierre del día (por técnico) ----------
+    const requireTecSelected = () => {
+      const tec = (fTec.value || "").trim();
+      if (!tec) {
+        err.textContent = "Selecciona un técnico (no puede ser 'Todos') para generar su cierre.";
+        return null;
+      }
+      return tec;
+    };
+
+const sourceToJpegDataUrl = (src) => new Promise((resolve, reject) => {
+  const img = new Image();
+  let objectUrl = null;
+
+  img.onload = () => {
+    try {
+      const MAX_W = 1400;
+      let w = img.naturalWidth || img.width;
+      let h = img.naturalHeight || img.height;
+
+      if (w > MAX_W) {
+        h = Math.round(h * (MAX_W / w));
+        w = MAX_W;
+      }
+
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      c.getContext("2d").drawImage(img, 0, 0, w, h);
+
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      resolve(c.toDataURL("image/jpeg", 0.85));
+    } catch (e) {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      reject(e);
+    }
+  };
+
+  img.onerror = (e) => {
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    reject(e);
+  };
+
+  if (src instanceof Blob) {
+    objectUrl = URL.createObjectURL(src);
+    img.src = objectUrl;
+  } else {
+    img.src = src;
+  }
+});
+
+    async function addPhotos(doc, y, title, images) {
+      const M = 14;
+      const W = 210 - M * 2;
+
+      if (!images || !images.length) return y;
+
+      if (y > 240) {
+        doc.addPage();
+        y = 16;
+      }
+
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(12);
+      doc.text(title, M, y);
+      y += 8;
+
+      const gap = 4;
+      const cellW = (W - gap * 2) / 3;
+      const cellH = 45;
+
+      const getImgSize = (dataUrl) => new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve({ w: img.naturalWidth || img.width, h: img.naturalHeight || img.height });
+        img.onerror = reject;
+        img.src = dataUrl;
+      });
+
+      let col = 0;
+      let x = M;
+      let startY = y;
+
+      for (let i = 0; i < images.length; i++) {
+        if (y + cellH > 285) {
+          doc.addPage();
+          y = 16;
+          startY = y;
+          col = 0;
+          x = M;
+        }
+
+        doc.setDrawColor(220);
+        doc.rect(x, y, cellW, cellH);
+
+        const pad = 2;
+        const maxW = cellW - pad * 2;
+        const maxH = cellH - pad * 2;
+
+        let iw = 1, ih = 1;
+        try {
+          const sz = await getImgSize(images[i]);
+          iw = sz.w; ih = sz.h;
+        } catch (_) {}
+
+        const scale = Math.min(maxW / iw, maxH / ih);
+        const dw = iw * scale;
+        const dh = ih * scale;
+
+        const dx = x + (cellW - dw) / 2;
+        const dy = y + (cellH - dh) / 2;
+
+        doc.addImage(images[i], "JPEG", dx, dy, dw, dh);
+
+        col++;
+        if (col === 3) {
+          col = 0;
+          x = M;
+          y += (cellH + gap);
+          startY = y;
+        } else {
+          x = M + (cellW + gap) * col;
+        }
+      }
+
+      if (col !== 0) {
+        y = startY + cellH + gap;
+      }
+
+      return y;
+    }
+
+    btnCierre.addEventListener("click", async () => {
+      ok.textContent = "";
+      err.textContent = "";
+
+      const tec = requireTecSelected();
+      if (!tec) return;
+
+      const date = (fFecha.value || "").trim();
+      if (!date) {
+        err.textContent = "Selecciona una fecha.";
+        return;
+      }
+
+let all = await ensureIds(await loadAll());
+
+      const parts = all
+        .filter(p => partDate(p) === date)
+        .filter(p => partTechs(p).includes(tec));
+
+      if (!parts.length) {
+        err.textContent = "No hay partes para ese técnico en esa fecha.";
+        return;
+      }
+
+      try {
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF({ unit: "mm", format: "a4" });
+
+        const M = 14;
+        const W = 210 - M * 2;
+        let y = 16;
+
+        // ===== PORTADA =====
+        const toN0 = (x) => (Number.isFinite(Number(x)) ? Number(x) : 0);
+        const getPartTotal = (p) => {
+          const direct = toN0(p?.totales?.total);
+          if (direct > 0) return direct;
+          return toN0(computeTotalFallback(p));
+        };
+        const sumTotal = parts.reduce((acc, p) => acc + getPartTotal(p), 0);
+
+        async function loadAsDataURL(url) {
+          const res = await fetch(url, { cache: "force-cache" });
+          if (!res.ok) throw new Error("Logo no disponible");
+          const blob = await res.blob();
+          return await new Promise((resolve, reject) => {
+            const r = new FileReader();
+            r.onload = () => resolve(String(r.result));
+            r.onerror = reject;
+            r.readAsDataURL(blob);
+          });
+        }
+
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(28);
+        doc.text("CIERRE DEL DÍA", 105, y, { align: "center" });
+
+        try {
+          const logoDataUrl = await loadAsDataURL("./public/assets/img/logo-canarias-accesible-2.png");
+          const logoW = 70;
+          const logoH = 70;
+          const logoX = (210 - logoW) / 2;
+          const logoY = y + 10;
+          doc.addImage(logoDataUrl, "PNG", logoX, logoY, logoW, logoH);
+          y = logoY + logoH + 12;
+        } catch (_) {
+          y += 18;
+        }
+
+        doc.setFontSize(13);
+        doc.text(`Técnico: ${tec}`, M, y);
+
+        y += 8;
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(12);
+        doc.text(`Fecha: ${date}`, M, y);
+
+        y += 8;
+        doc.text(`Nº de partes: ${parts.length}`, M, y);
+
+        y += 12;
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(16);
+        doc.text(`TOTAL DEL DÍA: ${EUR(sumTotal)}`, M, y);
+
+        y += 10;
+        doc.setDrawColor(30);
+        doc.setLineWidth(0.5);
+        doc.line(M, y, 210 - M, y);
+
+        doc.addPage();
+        y = 16;
+
+        for (let i = 0; i < parts.length; i++) {
+          const p = parts[i];
+
+          if (i > 0) {
+            doc.addPage();
+            y = 16;
+          }
+
+          const tipo = (p.tipo || "—").toUpperCase();
+          const id = p.header?.idCliente || "—";
+          const techs = partTechs(p).join(" + ") || "—";
+
+          const tot = (typeof p?.totales?.total === "number")
+            ? p.totales.total
+            : computeTotalFallback(p);
+
+          doc.setFont("helvetica", "bold");
+          doc.setFontSize(12);
+          doc.text(`${i + 1}. ${tipo} · Cliente ${id}`, M, y);
+          y += 6;
+
+          doc.setFont("helvetica", "normal");
+          doc.setFontSize(10.5);
+
+          const nombreCliente = String(p?.header?.nombreCliente || "").trim();
+          if (nombreCliente) {
+            doc.text(`Nombre cliente: ${nombreCliente}`, M, y);
+            y += 6;
+          }
+
+          doc.text(`Técnicos en parte: ${techs}`, M, y);
+          y += 6;
+
+          const d = p?.datos || {};
+          const t = p?.tarifas || {};
+          const toN = (x) => (Number.isFinite(Number(x)) ? Number(x) : 0);
+
+          if (p.tipo === "instalacion") {
+            const hi = toN(d.horas_inst);
+            const hd = toN(d.horas_despl);
+            const km = toN(d.kms);
+            const ma = toN(d.material);
+            const fu = d.furgon ? toN(t.FURGON ?? 80) : 0;
+
+            const P_INST = toN(t.P_INST ?? 27.95);
+            const P_DESPL = toN(t.P_DESPL ?? 19.28);
+            const P_KM = toN(t.P_KM ?? 0.31);
+            const TEC = 2;
+
+            const subtotalInst = hi * P_INST * TEC;
+            const subtotalDespl = hd * P_DESPL * TEC;
+            const subtotalKm = km * P_KM;
+
+            doc.text(`Instalación: ${hi.toFixed(1).replace(".", ",")} h x2 = ${EUR(subtotalInst)}`, M, y); y += 5;
+            doc.text(`Desplazamiento: ${hd.toFixed(1).replace(".", ",")} h x2 = ${EUR(subtotalDespl)}`, M, y); y += 5;
+            doc.text(`Kilómetros: ${String(km).replace(".", ",")} = ${EUR(subtotalKm)}`, M, y); y += 5;
+
+            const al = toN(d.almuerzo);
+            const ce = toN(d.cena);
+            const coLegacy = toN(d.comida);
+            const hasNewDietas = ("almuerzo" in d) || ("cena" in d);
+
+            if (hasNewDietas) {
+              doc.text(`Almuerzo: ${EUR(al)}`, M, y); y += 5;
+              doc.text(`Cena: ${EUR(ce)}`, M, y); y += 5;
+            } else {
+              doc.text(`Comida: ${EUR(coLegacy)}`, M, y); y += 5;
+            }
+
+            doc.text(`Material: ${EUR(ma)}`, M, y); y += 5;
+            doc.text(`Furgón: ${EUR(fu)}`, M, y); y += 5;
+          }
+
+          if (p.tipo === "reparacion") {
+            const hr = toN(d.horas_rep);
+            const hd = toN(d.horas_despl);
+            const km = toN(d.kms);
+            const co = toN(d.comida);
+            const maBase = toN(d.material);
+            const bat = toN(d.bateria);
+
+            const pil = Math.max(0, Math.floor(toN(d.pilas)));
+            const P_PILA = toN(t.P_PILA ?? 1.0);
+
+            const P_REP = toN(t.P_REP ?? 32.14);
+            const P_DESPL = toN(t.P_DESPL ?? 19.28);
+            const P_KM = toN(t.P_KM ?? 0.31);
+
+            const subtotalRep = hr * P_REP;
+            const subtotalDespl = hd * P_DESPL;
+            const subtotalKm = km * P_KM;
+
+            doc.text(`Reparación: ${hr.toFixed(1).replace(".", ",")} h = ${EUR(subtotalRep)}`, M, y); y += 5;
+            doc.text(`Desplazamiento: ${hd.toFixed(1).replace(".", ",")} h = ${EUR(subtotalDespl)}`, M, y); y += 5;
+            doc.text(`Kilómetros: ${String(km).replace(".", ",")} = ${EUR(subtotalKm)}`, M, y); y += 5;
+            doc.text(`Comida: ${EUR(co)}`, M, y); y += 5;
+            doc.text(`Material: ${EUR(maBase)}`, M, y); y += 5;
+            if (bat > 0) { doc.text(`Batería: ${EUR(bat)}`, M, y); y += 5; }
+            if (pil > 0) { doc.text(`Pilas: ${pil} x ${EUR(P_PILA)} = ${EUR(pil * P_PILA)}`, M, y); y += 5; }
+          }
+
+          if (p.tipo === "mantenimiento") {
+            const fijo = toN(d.fijo);
+            const mat = toN(d.material);
+            const bat = toN(d.bateria);
+
+            const pil = Math.max(0, Math.floor(toN(d.pilas)));
+            const P_PILA = toN(t.P_PILA ?? 1.0);
+
+            doc.text(`Mantenimiento (fijo): ${EUR(fijo)}`, M, y); y += 5;
+            if (mat > 0) { doc.text(`Material: ${EUR(mat)}`, M, y); y += 5; }
+            if (bat > 0) { doc.text(`Batería: ${EUR(bat)}`, M, y); y += 5; }
+            if (pil > 0) { doc.text(`Pilas: ${pil} x ${EUR(P_PILA)} = ${EUR(pil * P_PILA)}`, M, y); y += 5; }
+          }
+
+          y += 2;
+          doc.setFont("helvetica", "bold");
+          doc.text(`Total parte: ${EUR(tot)}`, M, y);
+          y += 8;
+          doc.setFont("helvetica", "normal");
+
+          const obs = (p.observaciones || "").trim() || "—";
+          const obsLines = doc.splitTextToSize(`Obs: ${obs}`, W);
+          doc.text(obsLines, M, y);
+          y += obsLines.length * 4.6 + 4;
+
+const fotos = p.fotos || {};
+
+const aImgsRaw =
+  Array.isArray(fotos.almuerzo_blobs) ? fotos.almuerzo_blobs
+  : Array.isArray(p.almuerzo_dataurls) ? p.almuerzo_dataurls
+  : (p.comida_dataurl ? [p.comida_dataurl] : []);
+
+const cImgsRaw =
+  Array.isArray(fotos.cena_blobs) ? fotos.cena_blobs
+  : Array.isArray(p.cena_dataurls) ? p.cena_dataurls
+  : [];
+
+const tImgsRaw =
+  Array.isArray(fotos.material_blobs) ? fotos.material_blobs
+  : Array.isArray(p.material_dataurls) ? p.material_dataurls
+  : [];
+
+const mImgsRaw =
+  Array.isArray(fotos.fotos_blobs) ? fotos.fotos_blobs
+  : Array.isArray(p.fotos_dataurls) ? p.fotos_dataurls
+  : [];
+
+const oImgsRaw =
+  Array.isArray(fotos.obs_part_blobs) ? fotos.obs_part_blobs
+  : Array.isArray(p.obs_part_dataurls) ? p.obs_part_dataurls
+  : [];
+
+          const aImgs = [];
+          const cImgs = [];
+          const tImgs = [];
+          const mImgs = [];
+          const oImgs = [];
+
+for (const u of aImgsRaw) { try { aImgs.push(await sourceToJpegDataUrl(u)); } catch (_) {} }
+for (const u of cImgsRaw) { try { cImgs.push(await sourceToJpegDataUrl(u)); } catch (_) {} }
+for (const u of tImgsRaw) { try { tImgs.push(await sourceToJpegDataUrl(u)); } catch (_) {} }
+for (const u of mImgsRaw) { try { mImgs.push(await sourceToJpegDataUrl(u)); } catch (_) {} }
+for (const u of oImgsRaw) { try { oImgs.push(await sourceToJpegDataUrl(u)); } catch (_) {} }
+
+          if ((aImgsRaw.length || cImgsRaw.length) || (p.tipo === "instalacion" && (aImgs.length || cImgs.length))) {
+            y = await addPhotos(doc, y, `FOTOS · Almuerzo (${aImgs.length})`, aImgs);
+            y = await addPhotos(doc, y, `FOTOS · Cena (${cImgs.length})`, cImgs);
+          } else {
+            y = await addPhotos(doc, y, `FOTOS · Ticket (${tImgs.length})`, tImgs);
+          }
+
+          y = await addPhotos(doc, y, `FOTOS · Material (${mImgs.length})`, mImgs);
+          y = await addPhotos(doc, y, `FOTOS · Parte cliente (${oImgs.length})`, oImgs);
+        }
+
+        const pdfBlob = doc.output("blob");
+        const filename = `Cierre_${date}_${tec.replaceAll(" ", "_")}.pdf`;
+        const file = new File([pdfBlob], filename, { type: "application/pdf" });
+
+        const batchId = `${date}::${tec}::${Date.now()}`;
+        const nowISO = new Date().toISOString();
+
+        const updated = all.map(p => {
+          if (partDate(p) !== date) return p;
+          if (!partTechs(p).includes(tec)) return p;
+
+          const sent_by = { ...(p.sent_by || {}) };
+          sent_by[tec] = { sent_at: nowISO, batch_id: batchId };
+          return { ...p, sent_by };
+        });
+
+for (const p of updated) {
+  await saveParte(p);
+}
+
+        let shared = false;
+
+        if (navigator.share && navigator.canShare) {
+          try {
+            if (navigator.canShare({ files: [file] })) {
+              await navigator.share({
+                files: [file],
+                title: "Cierre del día",
+                text: "Adjunto cierre del día en PDF."
+              });
+              shared = true;
+              ok.textContent = "Cierre compartido ✅";
+            }
+          } catch (shareErr) {
+            console.warn("Share failed, fallback to download:", shareErr);
+            shared = false;
+          }
+        }
+
+        if (!shared) {
+          const url = URL.createObjectURL(pdfBlob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+
+          setTimeout(() => URL.revokeObjectURL(url), 1500);
+
+          ok.textContent = "PDF descargado ✅ (no se pudo compartir desde el móvil)";
+        }
+
+        render();
+      } catch (e) {
+        console.error(e);
+        err.textContent = "ERROR PDF: " + (e?.message ? e.message : String(e));
+      }
+    });
+
+    // init
+    render();
+  </script>
+
+  <style>
+    .btnRow{ display:grid; gap:10px; }
+  </style>
+ <script>
+  window.PV_ENHANCE_TECH_SELECTS?.();
+</script> 
+</body>
+</html>
